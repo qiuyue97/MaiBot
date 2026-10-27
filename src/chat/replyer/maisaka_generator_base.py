@@ -69,6 +69,40 @@ logger = get_logger("replyer")
 
 REPLYER_MAX_HOOK_RETRIES = 3
 DUPLICATE_TARGET_REPLY_REMINDER_ARG = "_duplicate_target_reply_reminder"
+PROACTIVE_TOPIC_ARG = "_proactive_topic"  # patched: 由 builtin_tool/reply.py 在插件主动任务时置位
+TIME_GAP_DIVIDER_SECONDS = 3 * 3600  # patched: 同一天内间隔超过这么久就插一条“隔了 N 小时”
+
+
+def _describe_elapsed(moment: Optional[datetime]) -> str:
+    """patched: 把消息时间说成“N 分钟前 / N 小时前 / 昨天 / M月D日”，给 replyer 时间感。"""
+    if moment is None:
+        return ""
+    moment = moment.replace(tzinfo=None)  # 本地时间，忽略时区差异，避免 naive/aware 混算报错
+    now = datetime.now()
+    seconds = (now - moment).total_seconds()
+    if seconds < 3600:
+        return f"{max(1, int(seconds // 60))} 分钟前"
+    if moment.date() == now.date():
+        return f"{int(seconds // 3600)} 小时前"
+    if (now.date() - moment.date()).days == 1:
+        return "昨天"
+    return f"{moment.month}月{moment.day}日"
+
+
+def _build_time_divider(previous: Optional[datetime], current: Optional[datetime]) -> str:
+    """patched: 历史消息跨天或同日隔了很久时，返回插在它前面的分隔行；否则返回空串。"""
+    if current is None:
+        return ""
+    current = current.replace(tzinfo=None)
+    previous = previous.replace(tzinfo=None) if previous is not None else None
+    today = datetime.now().date()
+    if previous is None or previous.date() != current.date():
+        label = "今天" if current.date() == today else f"{current.month}月{current.day}日"
+        return f"—— 以下是{label}的聊天 ——"
+    if (current - previous).total_seconds() >= TIME_GAP_DIVIDER_SECONDS:
+        hours = int((current - previous).total_seconds() // 3600)
+        return f"—— 隔了约 {hours} 小时 ——"
+    return ""
 
 
 @dataclass
@@ -202,8 +236,11 @@ class BaseMaisakaReplyGenerator(RetroReplyPromptMixin):
         # )
         # return "\n".join(target_lines)
 
+        # patched: 原文“你这次要回复的就是这条目标消息，不要把其他历史消息当成当前回复对象”让回复只盯着一句话的字面
         target_lines = [
-            f"你想要回复的消息是 {sender_name} 发送的 msg_id为 {target_message_id} 的消息，你这次要回复的就是这条目标消息，不要把其他历史消息当成当前回复对象。",
+            f"你这次接的是 {sender_name} 发的 msg_id为 {target_message_id} 的消息（原文在下面）。"
+            "它只是你接话的落点：先结合它前面几条消息弄清大家在聊什么、谁在跟谁说话、是不是在玩梗或复读起哄，"
+            "再按【回复信息参考】的方向接；不要只按这一句的字面意思回答，也不要重新去接隔了很久、已经聊完的话题。",
         ]
         if quote_ids:
             target_lines.append(f"- quote={','.join(to_display_message_id(quote_id) for quote_id in quote_ids)}")
@@ -213,6 +250,21 @@ class BaseMaisakaReplyGenerator(RetroReplyPromptMixin):
             ]
         )
         return "\n".join(target_lines)
+
+    @staticmethod
+    def _build_proactive_topic_block(reply_message: Optional[SessionMessage]) -> str:
+        """patched: 插件主动任务借最近一条用户消息当锚点，这里明确告诉 replyer 是主动开新话题，不回应锚点。"""
+        last_seen = ""
+        if reply_message is not None:
+            user_info = reply_message.message_info.user_info
+            sender_name = user_info.user_cardname or user_info.user_nickname or user_info.user_id
+            elapsed = _describe_elapsed(reply_message.timestamp)
+            last_seen = f"聊天记录里最后一条是 {sender_name} {elapsed}说的，那只是告诉你上次聊到哪了，"
+        return (
+            "这次没有人在等你回复，是你自己主动开口找对方聊天。"
+            f"{last_seen}已经聊过的话题不要再接、不要再回应，也不要旧事重提；"
+            "照【回复信息参考】的方向开一个新话题，像隔了一阵子主动发消息那样自然地起个头。"
+        )
 
     @staticmethod
     def _render_target_at_component(component: AtComponent) -> str:
@@ -566,10 +618,9 @@ class BaseMaisakaReplyGenerator(RetroReplyPromptMixin):
     def _build_reply_reference_message(reply_reason: str, reply_reference: str) -> str:
         """有 reply reference 时只使用参考，否则使用 Planner 正文。"""
 
-        normalized_reference = reply_reference.strip()
-        if normalized_reference:
-            return normalized_reference
-        return reply_reason.strip()
+        normalized_reference = reply_reference.strip() or reply_reason.strip()
+        # patched: 加上标题，和系统提示里“【回复信息参考】是你刚才在心里打的草稿”对上
+        return f"【回复信息参考】{normalized_reference}" if normalized_reference else ""
 
     def _build_final_user_message(
         self,
@@ -581,7 +632,10 @@ class BaseMaisakaReplyGenerator(RetroReplyPromptMixin):
     ) -> str:
         current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         sections: List[str] = [f"当前时间：{current_time}"]
-        target_message_block = self._build_target_message_block(reply_message)
+        if (reply_tool_args or {}).get(PROACTIVE_TOPIC_ARG):
+            target_message_block = self._build_proactive_topic_block(reply_message)
+        else:
+            target_message_block = self._build_target_message_block(reply_message)
         if target_message_block:
             sections.append(target_message_block)
         duplicate_target_reply_reminder = str(
@@ -633,10 +687,17 @@ class BaseMaisakaReplyGenerator(RetroReplyPromptMixin):
         enable_visual_message: bool,
     ) -> List[ContextItem]:
         items: List[ContextItem] = []
+        previous_time: Optional[datetime] = None
 
         for message in chat_history:
             if self._is_replyer_filtered_history_message(message):
                 continue
+
+            # patched: 消息只标时刻不标日期，跨天、隔几小时的旧话题会被当成刚说的；按日期和间隔插分隔行
+            divider = _build_time_divider(previous_time, getattr(message, "timestamp", None))
+            if divider:
+                items.append(ContextItemBuilder().set_role(RoleType.User).add_text_content(divider).build())
+            previous_time = getattr(message, "timestamp", None) or previous_time
 
             if isinstance(message, ContentContextMessage):
                 guided_reply = self._extract_guided_bot_reply(message) if isinstance(message, SessionBackedMessage) else ""

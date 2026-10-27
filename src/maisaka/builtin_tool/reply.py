@@ -63,6 +63,24 @@ def _normalize_reply_arguments(raw_arguments: dict[str, Any]) -> tuple[dict[str,
     return parsed_arguments, ""
 
 
+_PROACTIVE_TOPIC_ARG = "_proactive_topic"  # patched: 主动任务开新话题，见 _is_proactive_reply
+
+
+def _is_proactive_reply(chat_history: list[LLMContextMessage]) -> bool:
+    """patched: 最近一条插件主动任务比最近一条他人真实消息更新时，这次 reply 是主动开口。
+
+    主动任务的 msg_id 只是借最近一条用户消息当锚点，replyer 不能把它当成要回应的对象，也不该引用它。
+    """
+    for message in reversed(chat_history):
+        if str(getattr(message, "source_kind", "") or "").startswith("plugin_proactive:"):
+            return True
+        if isinstance(message, SessionBackedMessage):
+            user_info = message.original_message.message_info.user_info
+            if not is_bot_self(message.original_message.platform, user_info.user_id):
+                return False
+    return False
+
+
 def _use_expression_intent() -> bool:
     return config_module.global_config.expression.use_vector_expression
 
@@ -458,7 +476,10 @@ async def handle_tool(
 
     replyer_chat_history = list(tool_ctx.runtime._chat_history)
     previous_target_reply = _find_recent_reply_to_target(replyer_chat_history, target_message_id)
-    if previous_target_reply:
+    proactive_topic = _is_proactive_reply(replyer_chat_history)
+    if proactive_topic:
+        reply_tool_args = {**reply_tool_args, _PROACTIVE_TOPIC_ARG: True}
+    elif previous_target_reply:
         reply_tool_args = _with_duplicate_target_reply_reminder(reply_tool_args, previous_target_reply)
     try:
         tool_ctx.runtime._update_stage_status("Replyer", "生成可见回复")
@@ -589,6 +610,8 @@ async def handle_tool(
         if reply_sequences else ""
     )
     set_quote, quote_probability = await _resolve_reply_quote(tool_ctx, first_text, target_message)
+    if proactive_topic:  # patched: 主动开新话题不引用锚点旧消息
+        set_quote, quote_probability = False, 0.0
     # 群聊与私聊均由各自的三档频率控制。
     effective_set_quote = set_quote
     if quote_probability is not None:

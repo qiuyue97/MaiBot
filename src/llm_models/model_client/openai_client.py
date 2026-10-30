@@ -9,6 +9,7 @@ import binascii
 import io
 import json
 import re
+import threading
 
 from json_repair import repair_json
 from openai import APIConnectionError, APIStatusError, AsyncOpenAI, AsyncStream, DefaultAsyncHttpxClient
@@ -108,6 +109,7 @@ from ..request_snapshot import (
 )
 
 logger = get_logger("llm_models")
+_PREPARE_SYNC_RESOURCES_LOCK = threading.Lock()  # 见 OpenaiClient.prepare_sync_resources
 
 SUPPORTED_OPENAI_IMAGE_FORMATS = {"jpeg", "png", "webp"}
 """OpenAI 兼容图片输入稳定支持的格式集合。"""
@@ -1469,7 +1471,10 @@ class OpenaiClient(AdapterClient[AsyncStream[ChatCompletionChunk], ChatCompletio
     def prepare_sync_resources(self) -> None:
         """在客户端初始化阶段加载 SDK 资源，避免首次请求在事件循环中同步导入。"""
         # SDK 将这些资源定义为 cached_property；这里只构造资源，不发起请求。
-        _ = self.client.chat.completions, self.client.embeddings, self.client.audio.transcriptions, self.client.responses
+        # 启动时多个调用方会在不同线程里同时初始化客户端，并发触发 openai.resources 的首次导入，
+        # Python 的模块导入锁会判定死锁（_DeadlockError）；串行执行这一步即可避免。
+        with _PREPARE_SYNC_RESOURCES_LOCK:
+            _ = self.client.chat.completions, self.client.embeddings, self.client.audio.transcriptions, self.client.responses
 
     def _build_request_headers(self, extra_headers: Dict[str, str]) -> Dict[str, str | Omit] | None:
         """构造单次请求的附加请求头。

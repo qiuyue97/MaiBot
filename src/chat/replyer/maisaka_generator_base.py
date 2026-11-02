@@ -255,11 +255,24 @@ class BaseMaisakaReplyGenerator(RetroReplyPromptMixin):
     def _build_proactive_topic_block(reply_message: Optional[SessionMessage]) -> str:
         """patched: 插件主动任务借最近一条用户消息当锚点，这里明确告诉 replyer 是主动开新话题，不回应锚点。"""
         last_seen = ""
+        is_group = False
         if reply_message is not None:
             user_info = reply_message.message_info.user_info
             sender_name = user_info.user_cardname or user_info.user_nickname or user_info.user_id
             elapsed = _describe_elapsed(reply_message.timestamp)
             last_seen = f"聊天记录里最后一条是 {sender_name} {elapsed}说的，那只是告诉你上次聊到哪了，"
+            is_group = bool(getattr(reply_message.message_info, "group_info", None))
+        if is_group:
+            # patched: 群里主动开口（比如分享生活）是说给全群听的，不能照私聊的口吻对着“你”说
+            return (
+                "这次没有人在等你回复，是你自己主动在群里开口，说给全群听的。"
+                f"{last_seen}已经聊过的话题不要再接、不要再回应，也不要旧事重提；"
+                "照【回复信息参考】的方向开一个新话题，像随手在群里发条动态那样自然地起个头。"
+                "群里的人不知道你此刻在哪、在做什么（生活摘要只有你自己看得到），所以第一次提到一件事时，"
+                "先用几个字交代清楚你在哪、在干嘛，再说细节；不要直接从细节或“结果……”说起，也不要提群里没人听过的人和事。"
+                "这不是对某一个人说话：不要用“你”单指某个人，也不要说“给你看看”这类私聊的话；"
+                "需要称呼时用“你们”“大家”，或者干脆不称呼。"
+            )
         return (
             "这次没有人在等你回复，是你自己主动开口找对方聊天。"
             f"{last_seen}已经聊过的话题不要再接、不要再回应，也不要旧事重提；"

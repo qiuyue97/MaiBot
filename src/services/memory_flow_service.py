@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime
+from math import ceil
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -28,6 +29,8 @@ from .image_writeback_journal import ImageWritebackJournal
 from .person_fact_reverification import reclassify_historical_person_facts
 
 logger = get_logger("memory_flow_service")
+
+BACKLOG_MAX_WINDOWS = 30  # 一次积压补写最多调几次模型；积压再多也只是每批更长
 
 
 @dataclass
@@ -583,6 +586,16 @@ class ChatSummaryWritebackService:
             return
 
         configured_context_length = self._context_length()
+        if pending_message_count > configured_context_length:
+            await self._summarize_backlog(
+                message=message,
+                session_id=session_id,
+                state=state,
+                message_time=message_time,
+                total_message_count=total_message_count,
+                configured_context_length=configured_context_length,
+            )
+            return
         context_length = self._effective_context_length(
             configured_context_length=configured_context_length,
             pending_message_count=pending_message_count,
@@ -621,6 +634,73 @@ class ChatSummaryWritebackService:
             f"total_messages={total_message_count} context_length={context_length} "
             f"detail={getattr(result, 'detail', '')}",
         )
+
+    @staticmethod
+    def _split_backlog(pending_message_count: int, configured_context_length: int) -> list[tuple[int, int]]:
+        """把积压切成 (起始下标, 结束下标) 的窗口，旧→新；批数有上限，积压太多时每批加长。"""
+        size = max(configured_context_length, ceil(pending_message_count / BACKLOG_MAX_WINDOWS))
+        return [(start, min(start + size, pending_message_count)) for start in range(0, pending_message_count, size)]
+
+    async def _summarize_backlog(
+        self,
+        *,
+        message: Any,
+        session_id: str,
+        state: ChatSummaryWritebackState,
+        message_time: float | None,
+        total_message_count: int,
+        configured_context_length: int,
+    ) -> None:
+        """积压超过一个窗口时（比如停机后补录了聊天记录）分批摘要，否则只有最后一个窗口进长期记忆。
+        每批成功就推进游标，中途失败下次从断点继续。"""
+        previous_count = state.last_trigger_message_count
+        pending_message_count = total_message_count - previous_count
+        pending = await asyncio.to_thread(
+            find_messages,
+            session_id=session_id,
+            end_time=message_time,
+            limit=pending_message_count,
+            limit_mode="latest",
+        )
+        windows = self._split_backlog(len(pending), configured_context_length)
+        logger.info(
+            f"聊天摘要积压补写开始: session_id={session_id} pending_messages={len(pending)} windows={len(windows)}"
+        )
+        base_count = total_message_count - len(pending)
+        for start, end in windows:
+            trigger_message_count = base_count + end
+            result = await memory_service.ingest_summary(
+                external_id=f"chat_auto_summary:{session_id}:{trigger_message_count}",
+                chat_id=session_id,
+                text="",
+                participants=[],
+                time_end=self._extract_message_timestamp(pending[end - 1]),
+                metadata={
+                    "generate_from_chat": True,
+                    "context_length": end - start,
+                    "configured_context_length": configured_context_length,
+                    "writeback_source": "memory_flow_service",
+                    "trigger": "backlog",
+                    "previous_trigger_message_count": state.last_trigger_message_count,
+                    "pending_message_count": end - start,
+                    "trigger_message_count": trigger_message_count,
+                    "summary_review_count": 2,
+                },
+                respect_filter=True,
+                user_id=self._extract_session_user_id(message),
+                group_id=self._extract_session_group_id(message),
+            )
+            if not getattr(result, "success", False):
+                logger.warning(
+                    f"聊天摘要积压补写中断，下次从断点继续: session_id={session_id} "
+                    f"done_until={state.last_trigger_message_count}/{total_message_count} "
+                    f"detail={getattr(result, 'detail', '')}"
+                )
+                return
+            state.last_trigger_message_count = trigger_message_count
+            state.last_trigger_time = time.time()
+        state.last_trigger_message_count = total_message_count
+        logger.info(f"聊天摘要积压补写完成: session_id={session_id} windows={len(windows)}")
 
     async def _load_last_trigger_message_count(self, *, session_id: str, total_message_count: int) -> int:
         """从已落库的聊天摘要恢复触发游标，避免服务重启后重复摘要。"""

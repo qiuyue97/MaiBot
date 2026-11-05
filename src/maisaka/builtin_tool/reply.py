@@ -29,6 +29,38 @@ from .context import BuiltinToolRuntimeContext, PostProcessedReplyMessage
 
 logger = get_logger("maisaka_builtin_reply")
 _REPLY_TOOL_INTERNAL_ARGUMENTS = {"msg_id", "_reply_id", "_plugin_reply_prompt"}
+
+
+async def _post_process_reply_items(
+    tool_ctx: Any,
+    reply_text: str,
+    invocation_arguments: Dict[str, Any],
+    post_process_options: Dict[str, Any],
+) -> Any:
+    """切分回复并解析附件。表情包只是点缀：解析不了就只发文字，别让写好的回复整条作废。
+
+    模型可能没看过表情包拼图就填序号。整条作废后 Planner 会重新发起回复，
+    而插件的轮次锁已经占上，新回复都会被清空，一条消息能空转好几分钟。
+    """
+    try:
+        return await tool_ctx.post_process_reply_message_items_async(
+            reply_text,
+            invocation_arguments,
+            **post_process_options,
+        )
+    except Exception as exc:
+        if invocation_arguments.get("attach_emoji") is None:
+            raise
+        logger.warning(
+            f"{tool_ctx.runtime.log_prefix} 表情包附件解析失败，改为只发文字: "
+            f"attach_emoji={invocation_arguments.get('attach_emoji')!r} 原因={exc}"
+        )
+    text_only_arguments = {key: value for key, value in invocation_arguments.items() if key != "attach_emoji"}
+    return await tool_ctx.post_process_reply_message_items_async(
+        reply_text,
+        text_only_arguments,
+        **post_process_options,
+    )
 _DUPLICATE_TARGET_REPLY_REMINDER_ARG = "_duplicate_target_reply_reminder"
 _DUPLICATE_TARGET_REPLY_REMINDER_TEMPLATE = (
     "你刚刚已经回复过这条消息，你刚刚的发言是：“{previous_reply}”\n"
@@ -551,10 +583,11 @@ async def handle_tool(
         )
 
     try:
-        reply_items = await tool_ctx.post_process_reply_message_items_async(
+        reply_items = await _post_process_reply_items(
+            tool_ctx,
             reply_text,
             invocation_arguments,
-            **post_process_options,
+            post_process_options,
         )
     except Exception as exc:
         reply_result.completion.response_text = reply_text

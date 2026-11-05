@@ -670,7 +670,9 @@ class ChatSummaryWritebackService:
         for start, end in windows:
             trigger_message_count = base_count + end
             result = await memory_service.ingest_summary(
-                external_id=f"chat_auto_summary:{session_id}:{trigger_message_count}",
+                # 不用 chat_auto_summary 前缀：游标可能落后于历史写回（内容和人物事实重复的摘要不推进游标），
+                # 补写时重算出的计数会撞上早就占用的 ID，每次都报错，积压再也推进不了。
+                external_id=f"chat_backlog_summary:{session_id}:{trigger_message_count}",
                 chat_id=session_id,
                 text="",
                 participants=[],
